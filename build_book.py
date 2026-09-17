@@ -95,6 +95,53 @@ def split_sections(content_lines):
     return sections
 
 
+def fill_empty_headings(lines: list) -> list:
+    """Insert a '*Work in progress.*' placeholder under any heading (of any
+    level) that has no content before the next heading of equal or shallower
+    depth. Without this, stub outline headings (e.g. a heading followed
+    immediately by more headings, with nothing written under it yet) render
+    as bare, empty sections in the generated book."""
+    heading_re = re.compile(r'^(#{1,6})\s')
+    n = len(lines)
+
+    def heading_level(line):
+        m = heading_re.match(line)
+        return len(m.group(1)) if m else None
+
+    def has_content_after(start_idx, level):
+        j = start_idx
+        code_state = False
+        while j < n:
+            nxt = lines[j]
+            nxt_stripped = nxt.strip()
+            if nxt_stripped.startswith("```"):
+                return True
+            if not code_state:
+                nlvl = heading_level(nxt)
+                if nlvl is not None and nlvl <= level:
+                    return False
+            if nxt_stripped != "":
+                return True
+            j += 1
+        return False
+
+    result = []
+    in_code = False
+    i = 0
+    while i < n:
+        line = lines[i]
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_code = not in_code
+        result.append(line)
+        if not in_code:
+            level = heading_level(line)
+            if level is not None and not has_content_after(i + 1, level):
+                result.append("\n*Work in progress.*\n\n")
+        i += 1
+    return result
+
+
 def clean_line_markup(line: str) -> str:
     # Convert [Text]{.mark} to <mark>Text</mark>
     line = re.sub(r'\[([^\]]+)\]\{\.mark\}', r'<mark>\1</mark>', line)
@@ -292,8 +339,13 @@ def generate_book_sources(input_file: str, temp_build_dir: str, repo_url: str):
         ch_dir = os.path.dirname(ch_path)
         new_lines = []
 
+        flat_lines = []
+        for chunk in ch["lines"]:
+            flat_lines.extend(chunk.splitlines(keepends=True) or [chunk])
+        ch_lines = fill_empty_headings(flat_lines)
+
         in_code = False
-        for line in ch["lines"]:
+        for line in ch_lines:
             stripped = line.strip()
             if stripped.startswith("```"):
                 in_code = not in_code
