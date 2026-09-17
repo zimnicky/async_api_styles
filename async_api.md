@@ -4471,7 +4471,7 @@ a framework for managing asynchronous execution. Eric Niebler has a nice intro a
 among few other [videos](https://youtu.be/xLboNIf7BTg?si=EhiqvfhuuHWD_1Tc)
 on the topic. Some examples of senders and receivers are provided in
 [P2300R10](http://wg21.link/P2300R10). In addition, stdexec has nice
-[Developer’s Guide](https://nvidia.github.io/stdexec/developer/index.html).
+[Developer's Guide](https://nvidia.github.io/stdexec/developer/index.html).
 
 Ultimately, we'd like to write a Sender that wraps our CURL_async_get() and produces
 a response:
@@ -4500,8 +4500,9 @@ stdexec::task<void> App_Senders(CURL_Async curl_async)
 }
 ```
 
-We'll use [stdexec](https://github.com/NVIDIA/stdexec) for a start since
-writing simple senders and receivers library version is too much (probably).
+We'll use [stdexec](https://github.com/NVIDIA/stdexec) for a start. Start from
+[senders basics](#senders_small) for a simplified senders implementation.
+
 As of [2026/09/13](https://github.com/NVIDIA/stdexec/commit/ae896337cbcfc242df609585a47f9822a0b48545),
 stdexec requires at least Visual Studio 2022 version 17.13.0 (MSVC 14.43).
 
@@ -4510,16 +4511,17 @@ We start by building simplest sender that does nothing:
 ``` cpp {.numberLines}
 struct Sender
 {
+    // ...
 };
 
-Sender work()
+Sender CURL_get()
 {
     return Sender{};
 }
 
 int main()
 {
-    stdexec::sync_wait(work());
+    stdexec::sync_wait(CURL_get());
 }
 ```
 
@@ -4576,14 +4578,14 @@ where we:
 With this, we can use our Sender:
 
 ``` cpp {.numberLines}
-Sender work()
+Sender CURL_get()
 {
     return Sender{};
 }
 
 int main()
 {
-    std::optional<std::tuple<>> x = stdexec::sync_wait(work());
+    std::optional<std::tuple<>> x = stdexec::sync_wait(CURL_get());
     assert(x.has_value());
 }
 ```
@@ -4595,19 +4597,19 @@ Since Sender concept is compatible with C++20 coroutines awaitable, just impleme
 a Sender allows to use it in coroutines. So, next coroutine works just fine too:
 
 ``` cpp {.numberLines}
-Sender work()
+Sender CURL_get()
 {
     return Sender{};
 }
 
-stdexec::task<void> work_coro()
+stdexec::task<void> CURL_get_coro()
 {
-    co_await work();
+    co_await CURL_get();
 }
 
 int main()
 {
-    std::optional<std::tuple<>> x = stdexec::sync_wait(work_coro());
+    std::optional<std::tuple<>> x = stdexec::sync_wait(CURL_get_coro());
     assert(x.has_value());
 }
 ```
@@ -4679,7 +4681,8 @@ int main()
 
 Yes. But note there are 2 issues:
 
-1) sync_wait() will block execution and we'll never tick our CURL loop; and
+1) sync_wait() will block execution and we'll never tick our CURL loop;
+   (note: we probably could inject our tick logic into sync_wait run_loop);
 2) we don't know when to stop.
 
 To continue main() execution, we must remove sync_wait and manually start the Sender.
@@ -4898,6 +4901,1096 @@ auto Senders_Main(CURL_Async curl_async)
         }));
 }
 ```
+
+## senders basics: implementing then() and sync_wait() {#senders_small}
+
+[source code](https://github.com/grishavanika/async_api_styles/tree/main/CH092_senders_simple).
+
+std::execution (with stdexec) is complex, generic and handles wide range of cases.
+
+Going with few assumptions and restrictions allows to show the core idea behind and
+implement basic version of senders and receivers. We'll assume:
+
+ - sender can only send one value T; so we have only set_value(T)
+ - sender can only fail with one value E; so we have only set_error(E)
+ - value and error is non-void type; so we don't need to branch void case
+ - no customization points
+ - no exceptions, everything is noexcept (including user-defined lambdas)
+ - we skip advanced concepts, like domains, environments and cancellation
+   (see [P2300R10](https://wg21.link/P2300R10))
+
+With that, we can start with coding the basic ideas:
+
+``` cpp {.numberLines}
+// Receiver.
+template<typename Receiver, typename T>
+void set_value(Receiver&& r, T&& v) noexcept
+{
+    FWD(r).set_value(FWD(v));
+}
+
+template<typename Receiver, typename E>
+void set_error(Receiver&& r, E&& e) noexcept
+{
+    FWD(r).set_error(FWD(e));
+}
+
+template<typename Receiver>
+void set_stopped(Receiver&& r) noexcept
+{
+    FWD(r).set_stopped();
+}
+```
+
+See, everything we can do with Receiver is those 3 things: set_value(T),
+set_error(E) and set_stopped().
+
+A note on FWD: typing `std::forward<Receiver>(r)` clutters the details; we simplify:
+
+``` cpp {.numberLines}
+#define FWD(...) ::std::forward<decltype(__VA_ARGS__)>(__VA_ARGS__)
+#define MOV(...) ::std::move(__VA_ARGS__)
+#define REMOVE_CVR(...) std::remove_cvref_t<__VA_ARGS__>
+using void_t = std::monostate;
+```
+
+For Sender, we define next API:
+
+``` cpp {.numberLines}
+// Sender.
+template<typename Sender, typename Receiver>
+auto connect(Sender&& s, Receiver&& r) noexcept
+{
+    return FWD(s).connect(FWD(r));
+}
+
+template<typename Sender>
+using sender_value_t = typename REMOVE_CVR(Sender)::value_t;
+
+template<typename Sender>
+using sender_error_t = typename REMOVE_CVR(Sender)::error_t;
+```
+
+Again, for Sender, we can only (a) connect() it to a Receiver and (b) query
+the types we would eventually send.
+
+Finishing with Operation API, we can only start():
+
+``` cpp {.numberLines}
+// Operation.
+template<typename Operation>
+void start(Operation& o) noexcept
+{
+    o.start();
+}
+```
+
+With only the pieces above, we can implement `just(v)` Sender:
+
+``` cpp {.numberLines}
+template<typename T>
+auto just(T&& v) noexcept
+{
+    return Sender_Just<REMOVE_CVR(T)>{._v = FWD(v)};
+}
+```
+
+so... just() only returns a wrapper (Sender_Just) that remembers a value `v`
+we would set later. No actual work done or started. Sender_Just is:
+
+``` cpp {.numberLines}
+template<typename T>
+struct Sender_Just
+{
+    using value_t = T;
+    using error_t = void_t;
+    T _v;
+    template<typename Receiver>
+    auto connect(Receiver&& r) noexcept
+    {
+        return State_Just<REMOVE_CVR(Receiver), T>{._r = FWD(r), ._v = MOV(_v)};
+    }
+};
+```
+
+where we signal that our operation would set_value() of a type T; there is no error;
+and when just Sender is connected to a Receiver, we... return the proper state
+we need; again, no actual work is done:
+
+``` cpp {.numberLines}
+template<typename Receiver, typename T>
+struct State_Just
+{
+    Receiver _r;
+    T _v;
+    void start() noexcept
+    {
+        set_value(MOV(_r), MOV(_v));
+    }
+};
+```
+
+Operation state (State_Just) is the non-movable, always alive (during operation)
+state that knows how to start the operation. For a just(1) case,
+we complete the operation immediately - by invoking set_value() on a Receiver
+and passing the value we have.
+
+One more time - Receiver could be thought as as callable/lambda. Saying:
+
+> invoking set_value() on a Receiver [...]
+
+is just a fancy way to say that we call a lambda and pass a result value to it.
+
+For now, we can't use a lambda as a Receiver directly (then() needs to be
+implemented). For a test, lets have a simple one:
+
+``` cpp {.numberLines}
+struct LogReceiver
+{
+    void set_value(auto&& v) noexcept
+    {
+        std::println("set_value({})", v);
+    }
+};
+
+int main()
+{
+    auto operation_state = connect(just(399), LogReceiver{});
+    start(operation_state); // *
+}
+```
+
+So:
+
+ - we have a just Sender
+ - we create a just Sender instance by calling `just(399)`
+ - just(399) describes a work that would be done when operation starts
+ - we connect the Sender to a specific instance of a Receiver (read "callback")
+ - connecting the Sender and the Receiver gives us Operation state back
+ - Operation state encodes all that work and data that are needed to execute
+   everything; finally
+ - we start an operation by invoking a .start() on an operation state
+
+We do not wait for operation completion in the code above because we know
+everything completes immediately, inline and we see the output:
+
+``` {.numberLines}
+set_value(399)
+```
+
+sync_wait does mostly the same under the hood. Lets implement it. sync_wait()
+accepts any Receiver, starts it, waits for it and returns the result:
+
+``` cpp {.numberLines}
+int main()
+{
+    auto x = sync_wait(just(1));
+}
+```
+
+Since any Sender, in general, can return either value T on success, error E on error
+or cancel signal (.set_stopped()), lets first write a type that can represent that:
+
+``` cpp {.numberLines}
+template<typename T, typename E>
+struct sync_wait_result : std::variant<std::monostate, T, E>
+{
+    bool was_stopped() const { return (this->index() == 0); }
+    bool has_value() const { return (this->index() == 1); }
+    bool has_error() const { return (this->index() == 2); }
+    T& value() { return std::get<1>(*this); }
+    E& error() { return std::get<2>(*this); }
+};
+```
+
+(Real stdexec::sync_wait() does it differently, mostly because errors
+are handled differently).
+
+Now, we can:
+
+``` cpp {.numberLines}
+template<typename Sender>
+auto sync_wait(Sender&& s) noexcept
+{
+    using T = sender_value_t<Sender>;
+    using E = sender_error_t<Sender>;
+    State_SyncWait<T, E> state;
+    auto o = connect(FWD(s), Receiver_SyncWait<T, E>{._state = &state});
+    start(o);
+    state.wait();
+    return MOV(state.get());
+}
+```
+
+See, given a Sender, we:
+
+ - query its value type (for success) and error type
+ - create our internal wait state (State_SyncWait)
+ - (note it's all local variable on the stack since we implement blocking wait); then
+ - connect a Sender with our Receiver (that knows how to notify operation end); then
+ - start an operation; finally
+ - do a blocking wait
+
+Lets check what Receiver_SyncWait does:
+
+``` cpp {.numberLines}
+template<typename T, typename E>
+struct Receiver_SyncWait
+{
+    State_SyncWait<T, E>* _state = nullptr;
+    template<typename U>
+    void set_value(U&& v) noexcept
+    {
+        _state->template emplace<1>(FWD(v));
+        _state->_done.set_value();
+    }
+    template<typename U>
+    void set_error(U&& e) noexcept
+    {
+        _state->template emplace<2>(FWD(e));
+        _state->_done.set_value();
+    }
+    void set_stopped() noexcept
+    {
+        _state->template emplace<0>();
+        _state->_done.set_value();
+    }
+};
+```
+
+It's a generic Receiver that remembers the values (by forwarding to State_SyncWait)
+and signalling done event. State_SyncWait is:
+
+``` cpp {.numberLines}
+template<typename T, typename E>
+struct State_SyncWait : sync_wait_result<T, E>
+{
+    std::promise<void> _done;
+    sync_wait_result<T, E>& get()
+    {
+        return *this;
+    }
+    void wait()
+    {
+        _done.get_future().wait();
+    }
+};
+```
+
+which holds `sync_wait_result<T, E>` that we use to save the values/errors and
+`std::promise<void>` which we (ab)use to implement that blocking waiting.
+
+That allows to wait for any Sender:
+
+``` cpp {.numberLines}
+int main()
+{
+    auto r = sync_wait(just(4));
+    assert(r.has_value());
+    assert(r.value() == 4);
+}
+```
+
+Lets continue and implement then() - which allows to attach a lambda to a Sender
+complete event:
+
+``` cpp {.numberLines}
+int main()
+{
+    auto r = sync_wait(then(just(3)
+        , [](int v) -> void_t
+    {
+        std::println("{}", v); // prints 3
+        return {};
+    }));
+    assert(r.has_value());
+}
+```
+
+then() accepts any Sender and invokes a given lambda when that Sender completes.
+Lambda accepts the result of the Sender and returns a new value. That new value
+is what a then-sender would return. Basically, then() transforms another Sender's
+value.
+
+``` cpp {.numberLines}
+template<typename Sender, typename Lambda>
+auto then(Sender&& s, Lambda&& f) noexcept
+{
+    return Sender_Then<REMOVE_CVR(Sender), REMOVE_CVR(Lambda)>
+        {._s = FWD(s), ._f = FWD(f)};
+}
+```
+
+See, we return Sender_Then that remembers inner sender that we would invoke and
+a lambda that we would call:
+
+``` cpp {.numberLines}
+template<typename Sender, typename Lambda>
+struct Sender_Then
+{
+    using inner_value_t = sender_value_t<Sender>;
+    using value_t = std::invoke_result_t<Lambda, inner_value_t>;
+    using error_t = sender_error_t<Sender>;
+    Sender _s;
+    Lambda _f;
+    template<typename Receiver>
+    auto connect(Receiver&& r) noexcept
+    {
+        using Receiver_ = Receiver_Then<REMOVE_CVR(Receiver), Lambda>;
+        return ::connect(MOV(_s), Receiver_{._r = FWD(r), ._f = MOV(_f)});
+    }
+};
+```
+
+Sender_Then:
+
+ - leaves error value (error_t) unchanged - the same as the original Sender since
+   we do not touch that
+ - signals that a value type we would return is the result of invoking a lambda; and
+ - on connect(), we just return original state because its so happens that
+   our then implementation does not need to store anything extra; and
+ - everything goes to our then-receiver
+
+Receiver_Then is:
+
+``` cpp {.numberLines}
+template<typename Receiver, typename Lambda>
+struct Receiver_Then
+{
+    Receiver _r;
+    Lambda _f;
+    template<typename U>
+    void set_value(U&& v) noexcept
+    {
+        ::set_value(MOV(_r), MOV(_f)(FWD(v)));
+    }
+    template<typename U>
+    void set_error(U&& e) noexcept
+    {
+        ::set_error(MOV(_r), FWD(e));
+    }
+    void set_stopped() noexcept
+    {
+        ::set_stopped(MOV(_r));
+    }
+};
+```
+
+See, set_value() just gets a value, calls a lambda and sends that to a next receiver.
+
+That's all. We are forced to return void_t since we do not support void values.
+But other then that, it's a complete implementation:
+
+``` cpp {.numberLines}
+sync_wait(then(just(3)
+    , [](int v) -> void_t
+{
+    std::println("{}", v); // prints 3
+    return {};
+}));
+```
+
+Finally, to show some async work, lets implement simple `async()` sender that
+completes the work on thread pool (using std::async):
+
+``` cpp {.numberLines}
+template<typename Receiver>
+struct State_Async
+{
+    Receiver _r;
+    std::future<void> _f;
+    void start() noexcept
+    {
+        _f = std::async(std::launch::async
+            , [r = MOV(_r)]() mutable
+        {
+            ::set_value(MOV(r), void_t());
+        });
+    }
+};
+
+struct Sender_Async
+{
+    using value_t = void_t;
+    using error_t = void_t;
+    template<typename Receiver>
+    auto connect(Receiver&& r) noexcept
+    {
+        return State_Async<REMOVE_CVR(Receiver)>{._r = FWD(r)};
+    }
+};
+
+auto async()
+{
+    return Sender_Async{};
+}
+```
+
+`std::async()` there is just for illustrative purpose, has nothing to do with senders
+and unused everywhere else.
+
+Connecting async() with then() allows to execute a lambda on a worker thread:
+
+``` cpp {.numberLines}
+int main()
+{
+    const auto main_thread_id = std::this_thread::get_id();
+    std::thread::id work_thread_id;
+    auto x = then(async()
+        , [&](void_t) -> void_t
+    {
+        work_thread_id = std::this_thread::get_id();
+        return {};
+    });
+    auto r = sync_wait(MOV(x));
+    assert(r.has_value());
+    assert(main_thread_id != work_thread_id);
+}
+```
+
+## senders basics: implementing when_all() {#senders_when_all}
+
+[source code](https://github.com/grishavanika/async_api_styles/tree/main/CH093_senders_when_all).
+
+Lets implement when_all() senders algorithm (sender adaptor, per [p2300r10](https://wg21.link/P2300R10)):
+
+``` cpp {.numberLines}
+int main()
+{
+    auto op = when_all(
+          just(6)
+        , just('v')
+        , just(7.2)
+        );
+    sync_wait(then(MOV(op), [](auto vs) -> void_t
+    {
+        auto [a, b, c] = vs;
+        std::println("{} {} {}", a, b, c);
+        return {};
+    }));
+}
+```
+
+Conceptually, we are given a set of N senders and we:
+
+ 1. start all of them at once;
+ 2. wait for completion of every sender/operation; and
+ 3. finish once everything is done.
+
+Given N senders, we are going to have N values at the end, so we return a tuple
+of all of the values in a successful case - `std::tuple<int, char, double>` for an
+example above.
+
+What happens when one of the senders fails? We just return this first error
+and discard all of the results. Since we store one error value, but there are N
+error types, we return `std::variant<E1, E2, ...>`.
+
+Similarly, when one of the senders is cancelled and we receive set_stopped(),
+we finish with set_stopped() too, discarding/ignoring all of the values.
+
+Real stdexec implementation cancels all of the senders yet-in-progress when first
+error or cancel arrives. For our simplified senders implementation, cancellation
+is not implemented so we do nothing and simply ensure all of the senders/operations
+complete (as if cancelled, but none of the senders support cancellation).
+
+Handling variadic set of Senders, each of which could send different types for
+values and errors is a bit noisy, but lets start with when_all():
+
+``` cpp {.numberLines}
+template<typename... Senders>
+auto when_all(Senders&&... ss)
+{
+    static_assert(sizeof...(Senders) >= 1);
+    return Sender_When_All<REMOVE_CVR(Senders)...>{FWD(ss)...};
+}
+```
+
+where we accept one or more Senders, construct our Sender wrapper - Sender_When_All - 
+which remembers all the Senders, since we need to start them later:
+
+``` cpp {.numberLines}
+template<typename... Senders>
+struct Sender_When_All
+{
+    using value_t = std::tuple<sender_value_t<Senders>...>;
+    using error_t = std::variant<sender_error_t<Senders>...>;
+
+    std::tuple<Senders...> _ss;
+
+    template<typename... Ss>
+    Sender_When_All(Ss&&... ss)
+        : _ss{FWD(ss)...}
+    {
+    }
+
+    template<typename Receiver>
+    auto connect(Receiver&& r) noexcept
+    {
+        using State = State_When_All<
+              REMOVE_CVR(Receiver)
+            , std::tuple<Senders...>
+            , std::index_sequence_for<Senders...>
+            >;
+        return State{._results{._r = FWD(r)}, ._ss{MOV(_ss)}};
+    }
+};
+```
+
+Sender_When_All does:
+
+ - propagate its set_value() type which is a tuple of all of the Senders values
+ - propagate its set_error() type (a variant of errors)
+ - remember all of the Senders - to be passed later, on connect()
+
+connect() of our when_all() Sender just returns the (operation) state
+- State_When_All:
+
+``` cpp {.numberLines}
+template<typename Receiver, typename... Senders, auto... Is>
+struct State_When_All<Receiver
+    , std::tuple<Senders...>     // Senders tuple
+    , std::index_sequence<Is...> // Senders indexes
+    >
+{
+    using Results = Result_When_All<
+          Receiver
+        , std::index_sequence<Is...>
+        , Senders...
+        >;
+    using operations_tuple_t = std::tuple<
+        state_storage_t<Senders
+            , Receiver_When_All<Is, Results>
+            >...
+        >;
+    using senders_tuple = std::tuple<Senders...>;
+
+    Results _results;
+    senders_tuple _ss;
+    operations_tuple_t _states;
+
+    template<auto I>
+    void apply_sender()
+    {
+        using Receiver_ = Receiver_When_All<I, Results>;
+
+        auto& sender = std::get<I>(_ss);
+        auto& state_storage = std::get<I>(_states);
+        auto& state = state_storage.template emplace<1>(
+            ::connect(MOV(sender), Receiver_{._r = &_results}));
+        ::start(state);
+    }
+
+    void start() noexcept
+    {
+        (apply_sender<Is>(), ...);
+    }
+};
+```
+
+where starting when_all() operation - starts all of the Senders - they could be
+"executing" concurrently or even in parallel. We have N operations active.
+
+See how our when_all() state embeds all of the other Senders operations states
+inline - everything is known at compile time:
+
+``` cpp {.numberLines}
+template<typename Sender, typename Receiver>
+using operation_state_t = decltype(::connect(
+    std::declval<Sender>(), std::declval<Receiver>()));
+
+// To handle non-default-constructible states.
+template<typename Sender, typename Receiver>
+using state_storage_t = std::variant<std::monostate
+    , operation_state_t<Sender, Receiver>>;
+
+using operations_tuple_t = std::tuple<
+    state_storage_t<Senders
+        , Receiver_When_All<Senders, Is, Results>
+        >...
+    >;
+
+operations_tuple_t _states;
+```
+
+Note, that we need to complete our operation when only last operation ends.
+To achieve this, we have our own, custom, per-sender Receiver - Receiver_When_All:
+
+``` cpp {.numberLines}
+using Receiver_ = Receiver_When_All<I, Results>;
+auto& state = state_storage.template emplace<1>(
+    ::connect(MOV(sender), Receiver_{._r = &_results}));
+::start(state);
+```
+
+so when one of the Senders completes, we notify shared results that given operation
+(indexed by I) is done:
+
+``` cpp {.numberLines}
+template<typename Sender, auto I, typename Results>
+struct Receiver_When_All
+{
+    Results* _r = nullptr;
+
+    template<typename U>
+    void set_value(U&& v) noexcept
+    {
+        _r->template set_value<I>(FWD(v));
+    }
+    template<typename U>
+    void set_error(U&& e) noexcept
+    {
+        _r->template set_error<I>(FWD(e));
+    }
+    void set_stopped() noexcept
+    {
+        _r->template set_stopped<I>();
+    }
+};
+```
+
+Results must be shared since we count completed operations:
+
+``` cpp {.numberLines}
+template<typename Receiver, auto... Is, typename... Senders>
+struct Result_When_All<Receiver, std::index_sequence<Is...>, Senders...>
+{
+    using Results = std::tuple<
+        sync_wait_result<
+              sender_value_t<Senders>
+            , sender_error_t<Senders>
+            >...
+        >;
+    std::mutex _lock;
+    Receiver _r;
+    Results _rs;
+    bool _has_error = false;
+    bool _was_stopped = false;
+    std::int32_t _count = sizeof...(Senders);
+
+    template<auto I, typename U>
+    void set_value(U&& v) noexcept
+    {
+        std::lock_guard _(_lock);
+        if ((_has_error || _was_stopped) == false)
+        {
+            std::get<I>(_rs).set_value(FWD(v));
+        }
+        try_finish();
+    }
+    template<auto I, typename U>
+    void set_error(U&& e) noexcept
+    {
+        std::lock_guard _(_lock);
+        if ((_has_error || _was_stopped) == false)
+        {
+            std::get<I>(_rs).set_error(FWD(e));
+            _has_error = true;
+            // real when_all() - also cancels the rest
+        }
+        try_finish();
+    }
+    template<auto I>
+    void set_stopped() noexcept
+    {
+        std::lock_guard _(_lock);
+        if ((_has_error || _was_stopped) == false)
+        {
+            std::get<I>(_rs).set_stopped();
+            _was_stopped = true;
+            // real when_all() - also cancels the rest
+        }
+        try_finish();
+    }
+    // ...
+};
+```
+
+see, when I(th) operation completes with success, we invoke `set_value<I>()` which
+remembers the value to final tuple of all of the results. In addition:
+
+ - when error or cancel/stop was already done, we skip set_value
+ - for set_error(), we remember the error once
+ - same for a stop.
+
+Note, how set_error(), set_value() and set_stopped() could be
+invoked all at the same time since we could have potentially truly parallel
+operations that complete all at once. Since all of them access same, shared state,
+we do need to have some kind of lock guard in place.
+
+Finally, try_finish() decrements operations in progress and completes when 
+last operation completes (`_count == 0`):
+
+``` cpp {.numberLines}
+void Result_When_All::try_finish()
+{
+    _count -= 1;
+    assert(_count >= 0);
+    if (_count == 0)
+    {
+        finish();
+    }
+}
+
+void Result_When_All::finish()
+{
+    if (_was_stopped)
+    {
+        ::set_stopped(MOV(_r));
+    }
+    else if (_has_error)
+    {
+        std::variant<sender_error_t<Senders>...> es;
+        ((std::get<Is>(_rs).has_error()
+            ? (void)es.template emplace<Is>(
+                MOV(std::get<Is>(_rs).error()))
+            : (void)0
+            ), ...);
+        ::set_error(MOV(_r), MOV(es));
+    }
+    else
+    {
+        ::set_value(MOV(_r)
+            , std::tuple<sender_value_t<Senders>...>(
+                std::get<Is>(_rs).value()...
+                )
+            );
+    }
+}
+```
+
+Handling templates a bit obfuscates the code, but overall:
+
+ - if any Sender was stopped, with complete with set_stopped()
+ - if there was an Error, we construct our error variant (with a proper index)
+   and complete with set_error(); finally
+ - when everything completed successfully, we construct a tuple of all of
+   the results and invoke set_value() on our target Receiver.
+
+That allows to wait for N operations:
+
+``` cpp {.numberLines}
+int main()
+{
+    auto async_just = [](auto v)
+    {
+        return then(async(), [copy = MOV(v)](void_t) mutable
+        {
+            return MOV(copy);
+        });
+    };
+    auto op = when_all(
+          async_just(6)
+        , async_just('v')
+        , just(7.2)
+        );
+    sync_wait(then(MOV(op), [](auto vs) -> void_t
+    {
+        auto [a, b, c] = vs;
+        std::println("{} {} {}", a, b, c);
+        return {};
+    }));
+}
+```
+
+(See how we composed async() and then() to create async_just() sender that completes
+on a worker thread).
+
+In addition, the code for this section implements just_error() and just_stopped()
+that are identical to just(), but complete with set_error() and set_stopped().
+
+``` cpp {.numberLines}
+int main()
+{
+    auto r = sync_wait(when_all(
+          just(1)
+        , just_error('x')
+        ));
+    assert(r.has_error());
+    auto e = r.error();
+    assert(e.index() == 1);
+    assert(std::get<1>(e) == 'x');
+}
+```
+
+## senders basics: implementing sequence() {#senders_sequence}
+
+[source code](https://github.com/grishavanika/async_api_styles/tree/main/CH094_senders_sequence).
+
+Similar to when_all(), given a set of N Senders, we need to start
+all of them one by one, in order. We simplify and require all of the
+Senders to return void on success and error; when one of the Senders fails or
+is cancelled, we fail or cancel whole sequence:
+
+``` cpp {.numberLines}
+template<typename... Senders>
+auto sequence(Senders&&... ss)
+{
+    static_assert(sizeof...(Senders) >= 1);
+    static_assert(std::conjunction_v<
+          std::is_same<void_t, sender_value_t<Senders>>...>
+        , "we expect all of the Senders to return void on success");
+    static_assert(std::conjunction_v<
+          std::is_same<void_t, sender_error_t<Senders>>...>
+        , "we expect all of the Senders to return void on error");
+    return Sender_Sequence<REMOVE_CVR(Senders)...>{FWD(ss)...};
+}
+```
+
+Sender_Sequence is the same as Sender_When_All, we just return State_Sequence:
+
+``` cpp {.numberLines}
+template<...>
+struct State_Sequence
+{
+    Receiver _r;
+    senders_tuple_t _ss;
+    operations_tuple_t _states;
+
+    template<auto I>
+    void apply_sender();
+
+    void start() noexcept
+    {
+        apply_sender<0>();
+    }
+};
+```
+
+sequence() operation start() just starts the 1st (at index 0) Sender, by invoking
+`apply_sender<0>()`. The logic of chaining - starting the next operation is
+in apply_sender(), where we start next one (I + 1), when previous completes:
+
+``` cpp {.numberLines}
+template<auto I>
+void State_Sequence::apply_sender()
+{
+    auto apply_next = [this](sync_wait_result<void_t, void_t> v)
+    {
+        if (v.has_error())
+        {
+            ::set_error(MOV(_r), MOV(v.error()));
+        }
+        else if (v.was_stopped())
+        {
+            ::set_stopped(MOV(_r));
+        }
+        else if constexpr ((I + 1) >= sizeof...(Senders))
+        {
+            ::set_value(MOV(_r), MOV(v.value()));
+        }
+        else
+        {
+            apply_sender<I + 1>();
+        }
+    };
+
+    auto& sender = std::get<I>(_ss);
+    auto& state_storage = std::get<I>(_states);
+    auto& state = state_storage.template emplace<1>(
+        ::connect(MOV(sender)
+            , Receiver_Sequence{._finish = MOV(apply_next)}));
+    ::start(state);
+}
+```
+
+Our internal Receiver_Sequence just invokes completion callback we pass to it,
+which is our apply_next():
+
+``` cpp {.numberLines}
+struct Receiver_Sequence
+{
+    using R = sync_wait_result<void_t, void_t>;
+    // Should not allocate due to SBO.
+    std::function<void (R)> _finish;
+    template<typename U>
+    void set_value(U&& v) noexcept
+    {
+        R r;
+        r.set_value(MOV(v));
+        _finish(MOV(r));
+    }
+    template<typename U>
+    void set_error(U&& e) noexcept
+    {
+        R r;
+        r.set_error(MOV(e));
+        _finish(MOV(r));
+    }
+    void set_stopped() noexcept
+    {
+        R r;
+        r.set_stopped();
+        _finish(MOV(r));
+    }
+};
+```
+
+There are issues with this simplified implementation, like, for instance,
+it's possible to stack-overflow when all of the Senders finish inline and we start
+next Sender.
+
+All in all, we can:
+
+``` cpp {.numberLines}
+int main()
+{
+    auto just_log = [](const char* text)
+    {
+        return then(async(), [text](void_t) -> void_t
+        {
+            std::println("{}", text);
+            return {};
+        });
+    };
+    sync_wait(sequence(
+          just_log("one")
+        , just_log("two")
+        , just_error(void_t{})
+        , just_log("three"))
+        );
+}
+```
+
+which prints:
+
+``` {.numberLines}
+one
+two
+```
+
+## senders basics: CURL get {#senders_CURLv2}
+
+[source code](https://github.com/grishavanika/async_api_styles/tree/main/CH095_senders_curlv2).
+
+Finally, we can implement the same CURL_sender_get() we did with stdexec,
+but using our simplified senders and receivers implementation.
+
+``` cpp {.numberLines}
+template<typename Receiver>
+struct State_CURL_Get
+{
+    void start() noexcept
+    {
+        assert(_curl_async);
+        CURL_async_get(_curl_async, _url
+            , this
+            , [](void* user_data, std::string response)
+        {
+            State_CURL_Get& state =
+                *static_cast<State_CURL_Get*>(user_data);
+            ::set_value(MOV(state._receiver), MOV(response));
+        });
+    }
+
+    Receiver _receiver;
+    CURL_Async _curl_async = nullptr;
+    std::string _url;
+};
+
+struct Sender_CURL_Get
+{
+    using value_t = std::string;
+    using error_t = void_t;
+
+    CURL_Async _curl_async = nullptr;
+    std::string _url;
+
+    template<typename Receiver>
+    auto connect(Receiver&& r)
+    {
+        return State_CURL_Get<REMOVE_CVR(Receiver)>
+        {
+            ._receiver = FWD(r),
+            ._curl_async = _curl_async,
+            ._url = std::move(_url)
+        };
+    }
+};
+
+Sender_CURL_Get CURL_sender_get(CURL_Async curl_async, const std::string& url)
+{
+    return Sender_CURL_Get
+    {
+        ._curl_async = curl_async,
+        ._url = url
+    };
+}
+
+auto App_SendersV0(CURL_Async curl_async)
+{
+    return sequence(
+        then(CURL_sender_get(curl_async, "localhost:5001/file1.txt")
+            , [](std::string r1) -> void_t
+        {
+            std::println("{}", r1);
+            return {};
+        }),
+        then(CURL_sender_get(curl_async, "localhost:5001/file2.txt")
+            , [](std::string r2) -> void_t
+        {
+            std::println("{}", r2);
+            return {};
+        })
+        );
+}
+
+auto App_SendersV1(CURL_Async curl_async)
+{
+    return then(
+        when_all(
+              CURL_sender_get(curl_async, "localhost:5001/file1.txt")
+            , CURL_sender_get(curl_async, "localhost:5001/file2.txt")
+            )
+        , [](auto vs) -> void_t
+        {
+            auto [r1, r2] = vs;
+            std::println("{}", r1);
+            std::println("{}", r2);
+            return void_t{};
+        });
+}
+
+struct AnyReceiver
+{
+    template<typename T>
+    void set_value(T&&...) noexcept { finish(); }
+    template<typename E>
+    void set_error(E&&) noexcept    { finish(); }
+    void set_stopped() noexcept     { finish(); }
+
+    void finish() noexcept
+    {
+        assert(_done);
+        assert(*_done == false);
+        *_done = true;
+    }
+
+    bool* _done = nullptr;
+};
+
+int main()
+{
+    CURL_Async curl_async = CURL_async_create();
+
+    bool done1 = false;
+    auto state1 = ::connect(App_SendersV0(curl_async), AnyReceiver{&done1});
+    ::start(state1);
+
+    bool done2 = false;
+    auto state2 = ::connect(App_SendersV1(curl_async), AnyReceiver{&done2});
+    ::start(state2);
+
+    while ((done1 == false)
+        || (done2 == false))
+    {
+        CURL_async_tick(curl_async);
+    }
+    CURL_async_destroy(curl_async);
+}
+```
+
+See [requests with senders/std::execution](#app_senders) for comparison with
+stdexec.
 
 # reactive streams
 
@@ -5409,6 +6502,9 @@ static void App_TasksV1()
 
 [source code](https://github.com/grishavanika/async_api_styles/tree/main/App_Senders),
 [API section](#senders_api).
+
+See the same code done without stdexec, just basic senders and receivers
+implementation: [senders basics: CURL get](#senders_CURLv2).
 
 SEQUENTIAL requests:
 
